@@ -2,13 +2,17 @@ export type AgentStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'completed
 
 export type AgentName =
   | 'supervisor'
+  | 'trend-research'
   | 'claude-builder'
-  | 'codex-reviewer'
-  | 'gemini-research'
   | 'asset-finder'
   | 'voiceover'
+  | 'subtitle'
   | 'video-render'
-  | 'qa';
+  | 'qa'
+  | 'publisher'
+  | 'analytics'
+  | 'codex-reviewer'
+  | 'gemini-research';
 
 export interface AgentState {
   name: AgentName;

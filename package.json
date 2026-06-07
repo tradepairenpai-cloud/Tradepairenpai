@@ -1,7 +1,7 @@
 {
-  "name": "tradepairenpai-maoc",
+  "name": "ai-agent-ops-control-center",
   "version": "1.0.0",
-  "description": "Multi-Agent Operations Center for short-form content production",
+  "description": "AI Agent Ops Control Center — Multi-Agent Operations Center for short-form content production",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

@@ -17,6 +17,12 @@ export const config = {
   creatomateApiKey: requireEnv('CREATOMATE_API_KEY'),
   elevenlabsApiKey: requireEnv('ELEVENLABS_API_KEY'),
   pexelsApiKey: requireEnv('PEXELS_API_KEY'),
+  tiktokApiKey: requireEnv('TIKTOK_API_KEY'),
+  tiktokClientKey: requireEnv('TIKTOK_CLIENT_KEY'),
+  tiktokClientSecret: requireEnv('TIKTOK_CLIENT_SECRET'),
+  tiktokRedirectUri: process.env['TIKTOK_REDIRECT_URI'] || '',
+  youtubeApiKey: requireEnv('YOUTUBE_API_KEY'),
+  metaApiKey: requireEnv('META_API_KEY'),
   appPort: parseInt(process.env['APP_PORT'] || '3000', 10),
   nodeEnv: process.env['NODE_ENV'] || 'development',
   // DEMO_MODE=true (default) allows mock render URLs without failing QA.
@@ -45,5 +51,10 @@ export function checkApiKeys(): Record<string, boolean> {
     CREATOMATE_API_KEY: !!config.creatomateApiKey,
     ELEVENLABS_API_KEY: !!config.elevenlabsApiKey,
     PEXELS_API_KEY: !!config.pexelsApiKey,
+    TIKTOK_API_KEY: !!config.tiktokApiKey,
+    TIKTOK_CLIENT_KEY: !!config.tiktokClientKey,
+    TIKTOK_CLIENT_SECRET: !!config.tiktokClientSecret,
+    YOUTUBE_API_KEY: !!config.youtubeApiKey,
+    META_API_KEY: !!config.metaApiKey,
   };
 }
