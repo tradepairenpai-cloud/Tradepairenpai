@@ -2,12 +2,17 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server as SocketIO } from 'socket.io';
 import * as dotenv from 'dotenv';
-import { config, checkApiKeys, ensureDirs, mockVideoAllowed } from '../lib/config';
+import { config, checkApiKeys, ensureDirs, mockVideoAllowed, checkPublisherReadiness, checkYoutubeConfig } from '../lib/config';
+import { getYouTubeAuthUrl, exchangeCodeForTokens, maskToken, resolveRedirectUri } from '../lib/youtube-oauth';
 import { checkAllClis } from '../lib/cli-tools';
 import { eventBus } from '../agents/event-bus';
 import { AgentState, AgentName, Task } from '../agents/types';
 import { logger } from '../lib/logger';
 import { SupervisorAgent } from '../agents/supervisor';
+import { agentRunner } from '../lib/agent-runner';
+import { loadAgentStates, saveAgentState, loadTasks, saveTask } from '../lib/state-store';
+import { sanitize } from '../lib/log-sanitizer';
+import { getAgentOfficeHtml } from './agent-office';
 
 dotenv.config();
 
@@ -38,6 +43,22 @@ const logs: { level: string; agent: string; message: string; timestamp: number }
 const tasks: Task[] = [];
 const MAX_LOGS = 300;
 
+// ─── Restore persisted state on startup ──────────────────────────────────────
+{
+  const persisted = loadAgentStates();
+  for (const [name, saved] of Object.entries(persisted)) {
+    const state = agentStates.get(name as AgentName);
+    if (state) {
+      state.currentTask  = saved.currentTask;
+      state.lastUpdated  = saved.lastUpdated;
+      // Reset 'running' to 'idle' — server was restarted, process is gone
+      state.status = saved.status === 'running' ? 'idle' : saved.status;
+    }
+  }
+  const savedTasks = loadTasks();
+  savedTasks.forEach(t => tasks.push(t));
+}
+
 // ─── Event bus → Socket.io bridge ────────────────────────────────────────────
 eventBus.on('agent:update', (event) => {
   const state = agentStates.get(event.agent);
@@ -45,20 +66,23 @@ eventBus.on('agent:update', (event) => {
     state.status = event.status;
     state.currentTask = event.task;
     state.lastUpdated = event.timestamp;
+    saveAgentState(state);
   }
   io.emit('agent:update', event);
 });
 
 eventBus.on('log', (event) => {
-  logs.push(event);
+  const safe = { ...event, message: sanitize(event.message) };
+  logs.push(safe);
   if (logs.length > MAX_LOGS) logs.shift();
-  io.emit('log', event);
+  io.emit('log', safe);
 });
 
 eventBus.on('task:update', (task: Task) => {
   const idx = tasks.findIndex(t => t.id === task.id);
   if (idx >= 0) tasks[idx] = task;
   else tasks.unshift(task);
+  saveTask(task);
   io.emit('task:update', task);
 });
 
@@ -97,7 +121,214 @@ app.post('/api/task', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Agent command routes ──────────────────────────────────────────────────────
+app.get('/api/agents/status', (_req, res) => {
+  res.json(Array.from(agentStates.values()));
+});
+
+app.post('/api/agents/:id/start', async (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  const { description } = req.body as { description?: string };
+  const task = description?.trim();
+  if (!task) return res.status(400).json({ error: 'description required' });
+  res.json(await agentRunner.start(name, task));
+});
+
+app.post('/api/agents/:id/stop', (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  res.json(agentRunner.stop(name));
+});
+
+app.post('/api/agents/:id/restart', async (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  const { description } = req.body as { description?: string };
+  res.json(await agentRunner.restart(name, description?.trim()));
+});
+
+app.post('/api/agents/:id/task', async (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  const { description } = req.body as { description?: string };
+  const task = description?.trim();
+  if (!task) return res.status(400).json({ error: 'description required' });
+  if (agentRunner.isRunning(name)) { agentRunner.stop(name); await new Promise(r => setTimeout(r, 300)); }
+  res.json(await agentRunner.start(name, task));
+});
+
+app.get('/api/agents/:id/logs', (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  res.json({ logs: agentRunner.getLogsForAgent(name).map(l => sanitize(l)) });
+});
+
+app.post('/api/agents/:id/retry', async (req, res) => {
+  const name = req.params['id']!;
+  if (!agentRunner.isValid(name)) return res.status(400).json({ error: 'Invalid agent name' });
+  res.json(await agentRunner.retry(name));
+});
+
+app.get('/api/system/health', async (_req, res) => {
+  const [clis, keys] = await Promise.all([checkAllClis(), Promise.resolve(checkApiKeys())]);
+  const mem = process.memoryUsage();
+  res.json({
+    uptime: process.uptime(),
+    node: process.version,
+    memMB: Math.round(mem.rss / 1024 / 1024),
+    cliStatus: { claude: clis['claude']!.ok, codex: clis['codex']!.ok, gemini: clis['gemini']!.ok },
+    cliVersions: {
+      claude: clis['claude']!.stdout || clis['claude']!.error || '',
+      codex:  clis['codex']!.stdout  || clis['codex']!.error  || '',
+      gemini: clis['gemini']!.stdout || clis['gemini']!.error || '',
+    },
+    cliInstallHints: {
+      gemini: clis['gemini']!.ok ? null : 'npm install -g @google/gemini-cli',
+      codex:  clis['codex']!.ok  ? null : 'npm install -g @openai/codex',
+      claude: clis['claude']!.ok ? null : 'ดู https://claude.ai/code',
+    },
+    apiStatus: keys,
+    publisherReadiness: checkPublisherReadiness(),
+    youtubeConfig: checkYoutubeConfig(),
+    renderMode: mockVideoAllowed() ? 'demo' : 'production',
+    demoMode: config.demoMode,
+  });
+});
+
+// ─── YouTube OAuth routes ──────────────────────────────────────────────────────
+app.get('/api/auth/youtube/login', (_req, res) => {
+  const redirectUri = resolveRedirectUri();
+  const url = getYouTubeAuthUrl();
+  if (!url) {
+    return res.status(400).send(`<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
+<title>YouTube OAuth — ข้อผิดพลาด</title>
+<style>body{font-family:sans-serif;background:#060c18;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{background:#0d1526;border:1px solid #1c2d4a;border-radius:12px;padding:32px;max-width:580px;width:95%}
+h2{color:#ef4444;margin-top:0}code{background:#111d33;padding:3px 10px;border-radius:4px;color:#fde68a;font-size:.88em;word-break:break-all;display:block;margin:6px 0}
+.step{background:#0a1628;border-left:3px solid #3b82f6;padding:12px 14px;margin:10px 0;border-radius:0 8px 8px 0;font-size:.86em;line-height:1.8}
+a{color:#60a5fa}</style>
+</head><body><div class="box">
+<h2>❌ YOUTUBE_CLIENT_ID ยังไม่ได้ตั้งค่า</h2>
+<p>ต้องตั้งค่า <code>YOUTUBE_CLIENT_ID</code> และ <code>YOUTUBE_CLIENT_SECRET</code> ใน .env ก่อน</p>
+<div class="step">
+<strong>วิธีตั้งค่า:</strong><br>
+1. ไปที่ <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console → Credentials</a><br>
+2. สร้าง <strong>OAuth 2.0 Client ID</strong> (Web application)<br>
+3. เพิ่ม Authorized redirect URI (ต้องตรงนี้เท่านั้น):<br>
+<code>${redirectUri}</code>
+4. ใส่ค่าใน <code>.env</code>:<br>
+<code>YOUTUBE_CLIENT_ID=xxx.apps.googleusercontent.com</code>
+<code>YOUTUBE_CLIENT_SECRET=your-secret</code>
+5. รีสตาร์ท: <code>npm run dev:dash</code>
+</div>
+</div></body></html>`);
+  }
+  logger.info(`[YouTube OAuth] Redirecting to Google consent page — redirect_uri: ${redirectUri}`);
+  res.redirect(url);
+});
+
+app.get('/api/auth/youtube/callback', async (req, res) => {
+  const { code, error, error_description } = req.query as {
+    code?: string; error?: string; error_description?: string;
+  };
+
+  if (error) {
+    logger.warn(`[YouTube OAuth] Callback error: ${sanitize(String(error))}`);
+    const redirectUri = resolveRedirectUri();
+
+    // redirect_uri_mismatch gets a dedicated Thai explanation
+    if (String(error) === 'redirect_uri_mismatch') {
+      return res.status(400).send(`<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
+<title>YouTube OAuth — Redirect URI ไม่ตรง</title>
+<style>body{font-family:sans-serif;background:#060c18;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{background:#0d1526;border:1px solid #1c2d4a;border-radius:12px;padding:32px;max-width:600px;width:95%}
+h2{color:#ef4444;margin-top:0}code{background:#111d33;padding:3px 10px;border-radius:4px;color:#fde68a;font-size:.92em;word-break:break-all;display:block;margin:8px 0}
+.step{background:#0a1628;border-left:3px solid #3b82f6;padding:12px 14px;margin:10px 0;border-radius:0 8px 8px 0;font-size:.88em;line-height:1.7}
+a{color:#60a5fa}.warn{color:#ef4444;font-weight:700}</style>
+</head><body><div class="box">
+<h2>❌ redirect_uri_mismatch</h2>
+<p>Redirect URI ไม่ตรงกับ Google Cloud Console</p>
+<p>กรุณาเพิ่ม URI นี้ใน <strong style="color:#fde68a">Authorized redirect URIs</strong>:</p>
+<code>${redirectUri}</code>
+<div class="step">
+<strong>ขั้นตอนแก้ไข:</strong><br>
+1. ไปที่ <a href="https://console.cloud.google.com/apis/credentials" target="_blank">console.cloud.google.com/apis/credentials</a><br>
+2. คลิก OAuth 2.0 Client ID ของคุณ<br>
+3. ใต้ <strong>Authorized redirect URIs</strong> → กด <strong>+ ADD URI</strong><br>
+4. วาง URI นี้ (copy ได้เลย):<br>
+<code>${redirectUri}</code>
+5. กด <strong>SAVE</strong> รอ 1-5 นาที<br>
+6. กลับมากด <a href="/api/auth/youtube/login">เชื่อมต่อ YouTube</a> อีกครั้ง
+</div>
+<p style="font-size:.8em;color:#64748b">หมายเหตุ: URI ต้องตรงกันทุกตัวอักษร รวมถึง https/http และ port</p>
+</div></body></html>`);
+    }
+
+    return res.status(400).send(`<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
+<title>YouTube OAuth — ปฏิเสธสิทธิ์</title>
+<style>body{font-family:sans-serif;background:#060c18;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{background:#0d1526;border:1px solid #1c2d4a;border-radius:12px;padding:32px;max-width:480px;width:95%}
+h2{color:#ef4444;margin-top:0}a{color:#60a5fa}</style>
+</head><body><div class="box">
+<h2>❌ ยกเลิกการอนุญาต</h2>
+<p>${sanitize(String(error_description || error || 'ไม่ได้รับสิทธิ์'))}</p>
+<p><a href="/api/auth/youtube/login">↩ ลองอีกครั้ง</a> &nbsp;|&nbsp; <a href="/">กลับ Dashboard</a></p>
+</div></body></html>`);
+  }
+
+  if (!code) {
+    return res.status(400).send('missing code parameter');
+  }
+
+  logger.info('[YouTube OAuth] Received auth code — exchanging for tokens...');
+  const result = await exchangeCodeForTokens(code);
+
+  if (!result.ok || !result.tokens) {
+    return res.status(400).send(`<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
+<title>YouTube OAuth — ล้มเหลว</title>
+<style>body{font-family:sans-serif;background:#060c18;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{background:#0d1526;border:1px solid #1c2d4a;border-radius:12px;padding:32px;max-width:480px;width:95%}
+h2{color:#ef4444;margin-top:0}code{background:#111d33;padding:2px 8px;border-radius:4px;color:#f87171}a{color:#60a5fa}</style>
+</head><body><div class="box">
+<h2>❌ Token Exchange ล้มเหลว</h2>
+<p><code>${sanitize(result.error || 'unknown error')}</code></p>
+<p><a href="/api/auth/youtube/login">↩ ลองอีกครั้ง</a> &nbsp;|&nbsp; <a href="/">กลับ Dashboard</a></p>
+</div></body></html>`);
+  }
+
+  const maskedAccess  = maskToken(result.tokens.access_token || '');
+  const maskedRefresh = maskToken(result.tokens.refresh_token || '');
+  const hasRefresh    = !!result.tokens.refresh_token;
+
+  logger.info(`[YouTube OAuth] Auth สำเร็จ — token: ${maskedAccess}`);
+
+  res.send(`<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
+<title>YouTube เชื่อมต่อสำเร็จ</title>
+<style>body{font-family:sans-serif;background:#060c18;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{background:#0d1526;border:1px solid #1c2d4a;border-radius:12px;padding:32px;max-width:560px;width:95%}
+h2{color:#10b981;margin-top:0}.ok{background:#052a1a;border:1px solid #0d4a2a;border-radius:8px;padding:14px;margin:14px 0;font-size:.9em}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #0d1526}
+.lbl{color:#94a3b8}.val{color:#60a5fa;font-family:monospace}
+.warn{background:#2a1a05;border:1px solid #4a2d0d;border-radius:8px;padding:12px;margin-top:14px;font-size:.82em;color:#fde68a;line-height:1.6}
+a{color:#60a5fa}code{background:#111d33;padding:2px 8px;border-radius:4px;color:#34d399;font-size:.88em}</style>
+</head><body><div class="box">
+<h2>✅ เชื่อมต่อ YouTube สำเร็จ!</h2>
+<p>ได้รับ OAuth token จาก Google สำเร็จแล้ว บันทึกลงใน .env โดยอัตโนมัติ</p>
+<div class="ok">
+  <div class="row"><span class="lbl">Access Token</span><span class="val">${maskedAccess}</span></div>
+  <div class="row"><span class="lbl">Refresh Token</span><span class="val">${hasRefresh ? maskedRefresh : '—'}</span></div>
+  <div class="row"><span class="lbl">Scope</span><span class="val">youtube.upload</span></div>
+  <div class="row" style="border:none"><span class="lbl">Channel</span><span class="val">UC1T5c2VEolzUDEEgA1fzQlg</span></div>
+</div>
+${!hasRefresh ? `<div class="warn">⚠️ ไม่ได้รับ refresh_token — อาจเกิดจากเคย authorize แล้วก่อนหน้า<br>ถ้าต้องการ refresh_token ให้ไปที่ <a href="https://myaccount.google.com/permissions" target="_blank">Google Permissions</a> แล้วถอนสิทธิ์ก่อน จากนั้น <a href="/api/auth/youtube/login">login ใหม่</a></div>` : ''}
+<p style="margin-top:18px">Token ถูกบันทึกใน <code>.env</code> แล้ว ระบบพร้อมอัปโหลด YouTube เป็น <strong style="color:#60a5fa">Private</strong></p>
+<p><a href="/">↩ กลับ Dashboard</a></p>
+</div></body></html>`);
+});
+
 app.get('/', (_req, res) => res.send(getDashboardHtml()));
+app.get('/agent-office', (_req, res) => res.send(getAgentOfficeHtml()));
 
 io.on('connection', async (socket) => {
   socket.emit('init', await buildState());
@@ -355,6 +586,41 @@ code{font-family:'Consolas','Courier New',monospace}
 /* ── Responsive ── */
 @media(max-width:1100px){.ov-grid{grid-template-columns:1fr}.stats-row{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:750px){:root{--sidebar:0px}#sidebar{display:none}.stats-row{grid-template-columns:1fr 1fr}}
+
+/* ── Agent control buttons ── */
+.ad-btns{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px;padding-top:8px;border-top:1px solid var(--bdr)}
+.btn-xs{padding:3px 9px;border-radius:5px;border:1px solid transparent;cursor:pointer;font-size:.68rem;font-weight:600;transition:all .15s;white-space:nowrap}
+.btn-start{background:var(--green-dim);color:var(--green);border-color:#0d4a2a}.btn-start:hover{background:#073a1e}
+.btn-stop{background:var(--red-dim);color:var(--red);border-color:#4a0d0d}.btn-stop:hover{background:#3a0808}
+.btn-restart{background:var(--surf2);color:var(--dim);border-color:var(--bdr)}.btn-restart:hover{background:var(--surf3);color:var(--txt)}
+.btn-task{background:var(--blue-dim);color:#93c5fd;border-color:#1e3a6b}.btn-task:hover{background:#162e55}
+.btn-log{background:var(--purple-dim);color:#c4b5fd;border-color:#2e1a5a}.btn-log:hover{background:#1a0d3a}
+.btn-retry{background:var(--amber-dim);color:var(--amber);border-color:#4a2d0d}.btn-retry:hover{background:#3a1f08}
+
+/* ── Health panel ── */
+.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:11px;margin-bottom:16px}
+.h-card{background:var(--surf);border:1px solid var(--bdr);border-radius:10px;padding:14px}
+.h-icon{font-size:1.3rem;margin-bottom:6px}
+.h-label{font-size:.68rem;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.h-val{font-size:.9rem;font-weight:700}
+.h-ok{color:var(--green)}.h-warn{color:var(--amber)}.h-err{color:var(--red)}.h-info{color:var(--blue)}
+
+/* ── Setup checklist ── */
+.setup-section{margin-bottom:16px}
+.setup-section-title{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:700;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--bdr)}
+.chk-item{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid #080e1e}
+.chk-item:last-child{border-bottom:none}
+.chk-icon{font-size:.9rem;flex-shrink:0;margin-top:1px;width:18px;text-align:center}
+.chk-body{flex:1;min-width:0}
+.chk-label{font-size:.78rem;font-weight:600}
+.chk-note{font-size:.68rem;color:var(--muted);margin-top:2px;line-height:1.5}
+.chk-hint{font-size:.66rem;font-family:'Consolas',monospace;color:var(--blue);background:var(--surf2);border:1px solid var(--bdr);border-radius:3px;padding:2px 7px;margin-top:4px;display:inline-block;white-space:pre}
+.warn-banner{background:var(--amber-dim);border:1px solid #4a2d0d;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:.78rem;color:var(--amber);line-height:1.6}
+.warn-banner strong{display:block;margin-bottom:3px}
+.ok-banner{background:var(--green-dim);border:1px solid #0d4a2a;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:.78rem;color:var(--green);line-height:1.6}
+
+/* ── Agent logs modal ── */
+.log-modal-box{height:340px;overflow-y:auto;font-family:'Consolas',monospace;font-size:.69rem;background:var(--bg);border:1px solid var(--bdr);border-radius:6px;padding:10px;margin-bottom:12px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
@@ -368,6 +634,32 @@ code{font-family:'Consolas','Courier New',monospace}
     <div class="modal-actions">
       <button onclick="closeModal()" class="btn btn-ghost">ยกเลิก</button>
       <button onclick="submitModal()" class="btn btn-primary">เริ่มงาน →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── MODAL: Agent Command ─────────────────────────────────────────────────── -->
+<div id="modal-agent-cmd" class="modal-ov">
+  <div class="modal">
+    <div class="modal-title" id="modal-cmd-title">🤖 สั่งงาน Agent</div>
+    <div style="font-size:.75rem;color:var(--dim);margin-bottom:9px" id="modal-cmd-role"></div>
+    <textarea id="agent-task-inp" class="modal-inp" rows="3" placeholder="อธิบายงานที่ต้องการให้ Agent นี้ทำ..."></textarea>
+    <div class="modal-hint">Agent จะรับงานทันทีและอัปเดตสถานะแบบ Real-time ผ่าน WebSocket</div>
+    <div class="modal-actions">
+      <button onclick="closeAgentModal()" class="btn btn-ghost">ยกเลิก</button>
+      <button onclick="submitAgentTask()" class="btn btn-primary">ส่งงาน →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── MODAL: Agent Logs ──────────────────────────────────────────────────────── -->
+<div id="modal-agent-logs" class="modal-ov">
+  <div class="modal" style="width:640px;max-width:95vw">
+    <div class="modal-title" id="modal-logs-title">📜 Log ของ Agent</div>
+    <div id="agent-log-box" class="log-modal-box">กำลังโหลด...</div>
+    <div class="modal-actions">
+      <button onclick="refreshAgentLogs()" class="btn btn-ghost btn-sm">↺ รีเฟรช</button>
+      <button onclick="closeLogsModal()" class="btn btn-ghost">ปิด</button>
     </div>
   </div>
 </div>
@@ -398,6 +690,7 @@ code{font-family:'Consolas','Courier New',monospace}
 
   <!-- SIM BAR -->
   <div class="sim-bar">
+    <span style="background:var(--amber-dim);color:var(--amber);border:1px solid #4a2d0d;border-radius:4px;padding:1px 7px;font-size:.63rem;font-weight:800;margin-right:4px">[DEMO]</span>
     <span class="sim-label">Simulation:</span>
     <span id="sim-dot" class="sim-dot"></span>
     <span id="sim-status-txt" style="color:var(--muted)">หยุด</span>
@@ -421,6 +714,7 @@ code{font-family:'Consolas','Courier New',monospace}
     <!-- SIDEBAR -->
     <aside id="sidebar">
       <div class="nav-sep">เมนูหลัก</div>
+      <div class="nav-item" onclick="window.location='/agent-office'" style="border-left:3px solid #fbbf24;background:#1a1205"><span class="nav-icon">🏢</span><span style="color:#fbbf24;font-weight:700">Agent Office</span></div>
       <div class="nav-item active" id="nav-overview" onclick="nav('overview')"><span class="nav-icon">🏠</span>ภาพรวมระบบ</div>
       <div class="nav-item" id="nav-agents" onclick="nav('agents')"><span class="nav-icon">🤖</span>เอเจนต์ทั้งหมด</div>
       <div class="nav-item" id="nav-tasks" onclick="nav('tasks')"><span class="nav-icon">▶</span>งานที่กำลังทำ</div>
@@ -430,6 +724,9 @@ code{font-family:'Consolas','Courier New',monospace}
       <div class="nav-item" id="nav-logs" onclick="nav('logs')"><span class="nav-icon">📜</span>Logs</div>
       <div class="nav-sep">ระบบ</div>
       <div class="nav-item" id="nav-integrations" onclick="nav('integrations')"><span class="nav-icon">🔌</span>Integrations</div>
+      <div class="nav-item" id="nav-health" onclick="nav('health');fetchHealth()"><span class="nav-icon">🏥</span>สถานะระบบ</div>
+      <div class="nav-item" id="nav-setup" onclick="nav('setup');fetchHealth()"><span class="nav-icon">✓</span>ตรวจสอบการตั้งค่า</div>
+      <div class="nav-item" id="nav-youtube" onclick="nav('youtube');fetchHealth()"><span class="nav-icon">▶</span>YouTube Publisher</div>
       <div class="nav-item" id="nav-settings" onclick="nav('settings')"><span class="nav-icon">⚙</span>ตั้งค่า</div>
       <div class="sb-bottom">
         <div class="sb-row"><span>เอเจนต์ทำงาน</span><span id="sb-run" style="color:var(--blue)">0</span></div>
@@ -594,6 +891,153 @@ code{font-family:'Consolas','Courier New',monospace}
         </div>
       </section>
 
+      <!-- ── SETUP CHECKLIST ── -->
+      <section id="sec-setup" class="section">
+        <div class="pg-title">ตรวจสอบการตั้งค่า (Setup Checklist)</div>
+        <div class="pg-sub">ตรวจสอบว่าระบบพร้อมใช้งานจริงหรือยัง — ทุกรายการต้องผ่านก่อนเปิดใช้งาน Production</div>
+        <div id="setup-banner"></div>
+        <div id="setup-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px"></div>
+      </section>
+
+      <!-- ── YOUTUBE PUBLISHER ── -->
+      <section id="sec-youtube" class="section">
+        <div class="pg-title">YouTube Publisher</div>
+        <div class="pg-sub">การตั้งค่าและสถานะการอัปโหลด YouTube อัตโนมัติ</div>
+
+        <!-- Status badges -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px" id="yt-badges">
+          <span style="background:#1a2a1a;color:#4ade80;border:1px solid #166534;border-radius:6px;padding:4px 14px;font-size:.72rem;font-weight:800">▶ YOUTUBE AUTO PUBLISH</span>
+          <span style="background:#1a1a2e;color:#60a5fa;border:1px solid #1e3a8a;border-radius:6px;padding:4px 14px;font-size:.72rem;font-weight:800" id="yt-badge-vis">🔒 PRIVATE VISIBILITY</span>
+          <span style="background:#1a2a1a;color:#4ade80;border:1px solid #166534;border-radius:6px;padding:4px 14px;font-size:.72rem;font-weight:800">✅ APPROVED PLATFORM</span>
+          <span id="yt-badge-oauth" style="background:#2a1a2e;color:#c084fc;border:1px solid #6b21a8;border-radius:6px;padding:4px 14px;font-size:.72rem;font-weight:800">🔑 YOUTUBE OAUTH REQUIRED</span>
+          <span style="background:#2a1a05;color:#f59e0b;border:1px solid #92400e;border-radius:6px;padding:4px 14px;font-size:.72rem;font-weight:800">🔍 QA REQUIRED</span>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+          <!-- Channel Info -->
+          <div class="card">
+            <div class="card-title">📺 YouTube Channel</div>
+            <div style="font-size:.82rem;line-height:2.1">
+              <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--bdr);padding:5px 0">
+                <span style="color:var(--muted)">Channel ID</span>
+                <code id="yt-channel-id" style="color:var(--blue);font-size:.78rem">กำลังโหลด...</code>
+              </div>
+              <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--bdr);padding:5px 0">
+                <span style="color:var(--muted)">YouTube Visibility</span>
+                <span id="yt-visibility" style="font-weight:700;color:var(--amber)">กำลังโหลด...</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--bdr);padding:5px 0">
+                <span style="color:var(--muted)">Auto Publish</span>
+                <span id="yt-auto" style="color:var(--green)">กำลังโหลด...</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--bdr);padding:5px 0">
+                <span style="color:var(--muted)">Category</span>
+                <span style="color:var(--txt)">Education</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;padding:5px 0">
+                <span style="color:var(--muted)">Scope Required</span>
+                <span style="color:var(--dim);font-size:.72rem;font-family:monospace">youtube.upload</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- OAuth Connection Status -->
+          <div class="card">
+            <div class="card-title">🔑 YouTube OAuth</div>
+            <div style="font-size:.82rem;line-height:2.1">
+              <div style="border-bottom:1px solid var(--bdr);padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">สถานะการเชื่อมต่อ</div>
+                <div id="yt-oauth-status" style="font-weight:700;color:var(--red)">กำลังโหลด...</div>
+              </div>
+              <div style="border-bottom:1px solid var(--bdr);padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">Access Token (OAuth)</div>
+                <div id="yt-oauth" style="color:var(--red);font-size:.76rem">กำลังโหลด...</div>
+              </div>
+              <div style="border-bottom:1px solid var(--bdr);padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">Refresh Token</div>
+                <div id="yt-refresh" style="color:var(--muted);font-size:.76rem">กำลังโหลด...</div>
+              </div>
+              <div style="padding:8px 0">
+                <a id="yt-connect-btn" href="/api/auth/youtube/login"
+                   style="display:inline-block;padding:7px 18px;border-radius:8px;background:#1d4ed8;color:#fff;font-size:.78rem;font-weight:700;text-decoration:none;transition:background .15s"
+                   onmouseover="this.style.background='#1e3a8a'" onmouseout="this.style.background='#1d4ed8'">
+                  ▶ เชื่อมต่อ YouTube
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Publisher Agent Status -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+          <div class="card">
+            <div class="card-title">🚀 Publisher Agent</div>
+            <div style="font-size:.82rem;line-height:2.1">
+              <div style="border-bottom:1px solid var(--bdr);padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">โหมดการทำงาน</div>
+                <div style="color:var(--blue)">อัปโหลด YouTube ได้อัตโนมัติ แต่วิดีโอจะเป็น Private เท่านั้น</div>
+              </div>
+              <div style="border-bottom:1px solid var(--bdr);padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">Non-YouTube Platforms</div>
+                <div id="yt-lock-status" style="color:var(--green);font-weight:700">กำลังโหลด...</div>
+              </div>
+              <div style="padding:5px 0">
+                <div style="color:var(--muted);font-size:.7rem;margin-bottom:2px">Platforms อนุญาต</div>
+                <div id="yt-allowed" style="color:var(--green)">กำลังโหลด...</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- OAuth Setup Guide -->
+          <div class="card">
+            <div class="card-title">📋 วิธีตั้งค่า OAuth</div>
+            <div style="font-size:.77rem;line-height:1.85;color:var(--dim)">
+              <div style="margin-bottom:6px;color:var(--txt);font-weight:600">Redirect URI ที่ต้องเพิ่มใน Google Cloud:</div>
+              <div id="yt-redirect-uri" style="font-family:monospace;font-size:.7rem;color:#fde68a;background:var(--surf2);border:1px solid var(--bdr);border-radius:4px;padding:4px 8px;margin-bottom:8px;word-break:break-all">กำลังโหลด...</div>
+              <div style="margin-bottom:8px;color:var(--txt);font-weight:600">ขั้นตอน:</div>
+              <div>1. รัน: <code style="color:var(--green)">npm run youtube:auth</code></div>
+              <div>2. เพิ่ม URI ด้านบนใน Google Cloud Console</div>
+              <div>3. ใส่ <code style="color:var(--amber)">YOUTUBE_CLIENT_SECRET</code> ใน .env</div>
+              <div>4. กดปุ่ม <strong style="color:#60a5fa">เชื่อมต่อ YouTube</strong> ด้านซ้าย</div>
+              <div style="margin-top:6px;color:var(--amber);font-size:.7rem">⚠️ Codespace: ตรวจสอบ Port 3000 → Public ใน PORTS tab</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Blocked Platforms -->
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">🚫 Platforms ที่ถูกบล็อก</div>
+          <div id="yt-blocked-list" style="font-size:.8rem;color:var(--muted)">กำลังโหลด...</div>
+        </div>
+
+        <!-- Privacy Rule -->
+        <div class="card">
+          <div class="card-title">🔒 กฎ Privacy</div>
+          <div style="font-size:.8rem;line-height:1.9;color:var(--dim)">
+            <div>• <code style="color:var(--amber)">YOUTUBE_VISIBILITY=private</code> — วิดีโอจะเป็น <strong style="color:var(--blue)">Private</strong> เสมอ (ค่าเริ่มต้น)</div>
+            <div>• <code style="color:var(--amber)">YOUTUBE_VISIBILITY=unlisted</code> — วิดีโอเป็น Unlisted (ไม่แสดงในการค้นหา)</div>
+            <div>• <code style="color:var(--amber)">YOUTUBE_VISIBILITY=public</code> — วิดีโอจะเป็น Public <strong style="color:var(--red)">(ต้องตั้งค่าชัดเจน)</strong></div>
+            <div style="margin-top:8px;color:var(--amber)">⚠️ ระบบจะไม่อัปโหลด Public โดยไม่ได้ตั้งค่า YOUTUBE_VISIBILITY=public อย่างชัดเจน</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── HEALTH ── -->
+      <section id="sec-health" class="section">
+        <div class="pg-title">สถานะระบบ (System Health)</div>
+        <div class="pg-sub">ตรวจสอบ Node Server, CLI Tools, และ API ที่เชื่อมต่อแล้ว / ยังไม่ได้ตั้งค่า</div>
+        <div id="health-grid" class="health-grid">
+          <div class="h-card"><div class="h-icon">⏳</div><div class="h-label">สถานะ</div><div class="h-val h-warn">กำลังโหลด...</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title" style="justify-content:space-between">
+            <span>🔑 API ที่เชื่อมต่อแล้ว / API ที่ยังไม่ได้ตั้งค่า</span>
+            <button onclick="fetchHealth()" class="btn btn-ghost btn-sm">↺ รีเฟรช</button>
+          </div>
+          <div id="health-api-list" style="font-size:.8rem;color:var(--muted);padding:8px 0">กำลังโหลด...</div>
+        </div>
+      </section>
+
     </main>
   </div>
 </div>
@@ -686,6 +1130,7 @@ socket.on('init', data => {
 
   const hasMock = !data.renderMode?.hasCreatomateKey;
   document.getElementById('sb-mock').style.display = hasMock ? 'block' : 'none';
+  fetchHealth();
 });
 
 socket.on('agent:update', ev => {
@@ -759,7 +1204,9 @@ function renderAdGrid() {
   const list = Object.values(agentStore).filter(a => agFilter === 'all' || a.status === agFilter);
   el.innerHTML = list.map(a => {
     const m = AMETA[a.name] || { icon:'🤖', role:'AI Agent' };
-    const isRun = a.status === 'running';
+    const isRun    = a.status === 'running';
+    const isFailed = a.status === 'failed';
+    const n = esc(a.name);
     return \`<div class="ad-card \${isRun ? 'is-running' : ''}">
       <div class="ad-hdr">
         <div class="ad-icon \${isRun ? 'ag-icon-float' : ''}">\${m.icon}</div>
@@ -769,6 +1216,14 @@ function renderAdGrid() {
       <div class="ad-row"><span class="ad-key">อัปเดต</span><span style="font-size:.7rem;color:var(--dim)">\${timeAgo(a.lastUpdated)}</span></div>
       \${isRun ? '<div class="prog-bar"><div class="prog-fill"></div></div>' : ''}
       <div class="ad-task">\${esc(a.currentTask) || '—'}</div>
+      <div class="ad-btns">
+        \${!isRun ? \`<button class="btn-xs btn-start" onclick="openAgentTask('\${n}','เริ่มทำงาน')">▶ เริ่มทำงาน</button>\` : ''}
+        \${isRun  ? \`<button class="btn-xs btn-stop"  onclick="agentCmd('\${n}','stop')">⏹ หยุดทำงาน</button>\` : ''}
+        <button class="btn-xs btn-restart" onclick="agentCmd('\${n}','restart')">↺ รีสตาร์ท</button>
+        <button class="btn-xs btn-task"    onclick="openAgentTask('\${n}','ส่งงานใหม่')">📋 ส่งงานใหม่</button>
+        <button class="btn-xs btn-log"     onclick="viewAgentLogs('\${n}')">📜 ดู Log</button>
+        \${isFailed ? \`<button class="btn-xs btn-retry" onclick="agentCmd('\${n}','retry')">↩ ลองใหม่</button>\` : ''}
+      </div>
     </div>\`;
   }).join('') || '<div style="color:var(--muted);font-size:.8rem;padding:16px 0">ไม่พบเอเจนต์ที่ตรงกัน</div>';
 }
@@ -1021,6 +1476,263 @@ async function postTask(desc) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// AGENT COMMANDS
+// ══════════════════════════════════════════════════════════════════════════════
+let _agentCmdTarget = null;
+
+async function agentCmd(name, cmd) {
+  try {
+    const r = await fetch(\`/api/agents/\${encodeURIComponent(name)}/\${cmd}\`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    });
+    const d = await r.json();
+    if (d.error) console.warn(\`Agent \${cmd} error:\`, d.error);
+  } catch(e) { console.error('agentCmd failed:', e); }
+}
+
+function openAgentTask(name, label) {
+  _agentCmdTarget = name;
+  const m = AMETA[name] || { icon:'🤖', role:'' };
+  const ag = agentStore[name];
+  document.getElementById('modal-cmd-title').textContent = \`\${m.icon} \${label || 'สั่งงาน Agent'}: \${ag?.thaiLabel || name}\`;
+  document.getElementById('modal-cmd-role').textContent = m.role;
+  document.getElementById('agent-task-inp').value = '';
+  document.getElementById('modal-agent-cmd').classList.add('open');
+  setTimeout(() => document.getElementById('agent-task-inp').focus(), 50);
+}
+
+function closeAgentModal() {
+  document.getElementById('modal-agent-cmd').classList.remove('open');
+  _agentCmdTarget = null;
+}
+
+async function submitAgentTask() {
+  const name = _agentCmdTarget;
+  const desc = document.getElementById('agent-task-inp').value.trim();
+  if (!name || !desc) return;
+  closeAgentModal();
+  try {
+    const r = await fetch(\`/api/agents/\${encodeURIComponent(name)}/task\`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: desc }),
+    });
+    const d = await r.json();
+    if (d.error) console.warn('assignTask error:', d.error);
+  } catch(e) { console.error('submitAgentTask failed:', e); }
+}
+
+let _logsTarget = null;
+async function viewAgentLogs(name) {
+  _logsTarget = name;
+  const ag = agentStore[name];
+  document.getElementById('modal-logs-title').textContent = \`📜 Log: \${ag?.thaiLabel || name}\`;
+  document.getElementById('agent-log-box').textContent = 'กำลังโหลด...';
+  document.getElementById('modal-agent-logs').classList.add('open');
+  await _loadAgentLogs(name);
+}
+
+async function refreshAgentLogs() {
+  if (_logsTarget) await _loadAgentLogs(_logsTarget);
+}
+
+async function _loadAgentLogs(name) {
+  try {
+    const r = await fetch(\`/api/agents/\${encodeURIComponent(name)}/logs\`);
+    const d = await r.json();
+    const box = document.getElementById('agent-log-box');
+    if (!d.logs || !d.logs.length) { box.textContent = 'ยังไม่มี log สำหรับ agent นี้\\n(log จะปรากฏหลังจากสั่งงาน agent ครั้งแรก)'; return; }
+    box.textContent = d.logs.join('\\n');
+    box.scrollTop = box.scrollHeight;
+  } catch(e) { document.getElementById('agent-log-box').textContent = 'ไม่สามารถโหลด log: ' + e.message; }
+}
+
+function closeLogsModal() {
+  document.getElementById('modal-agent-logs').classList.remove('open');
+  _logsTarget = null;
+}
+
+// Close modals on overlay click
+document.getElementById('modal-agent-cmd').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-agent-cmd')) closeAgentModal();
+});
+document.getElementById('modal-agent-logs').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-agent-logs')) closeLogsModal();
+});
+document.getElementById('agent-task-inp').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitAgentTask(); }
+  if (e.key === 'Escape') closeAgentModal();
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SYSTEM HEALTH
+// ══════════════════════════════════════════════════════════════════════════════
+async function fetchHealth() {
+  try {
+    const r = await fetch('/api/system/health');
+    const d = await r.json();
+    renderHealth(d);
+    renderSetupChecklist(d);
+    renderYouTubeStatus(d);
+  } catch(e) { console.error('fetchHealth failed:', e); }
+}
+
+function renderYouTubeStatus(d) {
+  const yt = d.youtubeConfig;
+  if (!yt) return;
+
+  const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+
+  setText('yt-channel-id', yt.channelId || 'ยังไม่ได้ตั้งค่า YOUTUBE_CHANNEL_ID');
+
+  const visEl = document.getElementById('yt-visibility');
+  if (visEl) {
+    const visColors = { private: '#60a5fa', unlisted: '#f59e0b', public: '#ef4444' };
+    const visLabel  = { private: '🔒 Private', unlisted: '🔓 Unlisted', public: '🌐 Public' };
+    visEl.textContent = visLabel[yt.visibility] || yt.visibility;
+    visEl.style.color = visColors[yt.visibility] || 'var(--txt)';
+  }
+
+  const badgeVis = document.getElementById('yt-badge-vis');
+  if (badgeVis) {
+    if (yt.visibility === 'private') {
+      badgeVis.textContent = '🔒 PRIVATE VISIBILITY';
+      badgeVis.style.background = '#1a1a2e';
+      badgeVis.style.color = '#60a5fa';
+      badgeVis.style.borderColor = '#1e3a8a';
+    } else if (yt.visibility === 'public') {
+      badgeVis.textContent = '🌐 PUBLIC VISIBILITY';
+      badgeVis.style.background = '#2a0505';
+      badgeVis.style.color = '#ef4444';
+      badgeVis.style.borderColor = '#991b1b';
+    } else {
+      badgeVis.textContent = '🔓 UNLISTED VISIBILITY';
+      badgeVis.style.background = '#2a1a05';
+      badgeVis.style.color = '#f59e0b';
+      badgeVis.style.borderColor = '#92400e';
+    }
+  }
+
+  setText('yt-auto', yt.autoPublish ? '✅ เปิดใช้งาน (AUTO_PUBLISH)' : '❌ ปิดอยู่');
+
+  // OAuth connection status
+  const oauthStatusEl = document.getElementById('yt-oauth-status');
+  if (oauthStatusEl) {
+    if (yt.oauthReady) {
+      oauthStatusEl.textContent = '✅ เชื่อมต่อแล้ว — พร้อมอัปโหลด';
+      oauthStatusEl.style.color = 'var(--green)';
+    } else if (yt.hasRefreshToken) {
+      oauthStatusEl.textContent = '🔄 มี Refresh Token — จะ refresh อัตโนมัติ';
+      oauthStatusEl.style.color = 'var(--amber)';
+    } else {
+      oauthStatusEl.textContent = '❌ ยังไม่ได้เชื่อมต่อ — กดปุ่มด้านล่าง';
+      oauthStatusEl.style.color = 'var(--red)';
+    }
+  }
+
+  const oauthEl = document.getElementById('yt-oauth');
+  if (oauthEl) {
+    oauthEl.textContent = yt.oauthReady ? '✅ ตั้งค่าแล้ว (YOUTUBE_OAUTH_TOKEN)' : '❌ ยังไม่ได้ตั้งค่า';
+    oauthEl.style.color = yt.oauthReady ? 'var(--green)' : 'var(--red)';
+  }
+
+  const refreshEl = document.getElementById('yt-refresh');
+  if (refreshEl) {
+    refreshEl.textContent = yt.hasRefreshToken ? '✅ มี YOUTUBE_REFRESH_TOKEN (auto-refresh)' : '❌ ยังไม่มี (จะขอใหม่หลัง login)';
+    refreshEl.style.color = yt.hasRefreshToken ? 'var(--green)' : 'var(--muted)';
+  }
+
+  // OAuth badge — green when connected, purple when required
+  const oauthBadge = document.getElementById('yt-badge-oauth');
+  if (oauthBadge) {
+    if (yt.oauthConnected) {
+      oauthBadge.textContent = '✅ YOUTUBE OAUTH CONNECTED';
+      oauthBadge.style.background = '#052a1a';
+      oauthBadge.style.color = '#4ade80';
+      oauthBadge.style.borderColor = '#166534';
+    } else {
+      oauthBadge.textContent = '🔑 YOUTUBE OAUTH REQUIRED';
+      oauthBadge.style.background = '#2a1a2e';
+      oauthBadge.style.color = '#c084fc';
+      oauthBadge.style.borderColor = '#6b21a8';
+    }
+  }
+
+  // Connect button — show reconnect when already connected
+  const connectBtn = document.getElementById('yt-connect-btn');
+  if (connectBtn) {
+    if (yt.oauthConnected) {
+      connectBtn.textContent = '↺ เชื่อมต่อใหม่';
+      connectBtn.style.background = '#052a1a';
+      connectBtn.style.color = '#10b981';
+    } else {
+      connectBtn.textContent = '▶ เชื่อมต่อ YouTube';
+      connectBtn.style.background = '#1d4ed8';
+      connectBtn.style.color = '#fff';
+    }
+  }
+
+  const lockEl = document.getElementById('yt-lock-status');
+  if (lockEl) {
+    lockEl.textContent = yt.nonYoutubeLocked
+      ? '🔒 ล็อกทั้งหมด — ไม่อนุญาต Non-YouTube'
+      : '⚠️ ไม่ได้ล็อก — ตรวจสอบ NON_YOUTUBE_PUBLISHER_LOCKED';
+    lockEl.style.color = yt.nonYoutubeLocked ? 'var(--green)' : 'var(--amber)';
+  }
+
+  // Redirect URI display
+  const redirectEl = document.getElementById('yt-redirect-uri');
+  if (redirectEl && yt.redirectUri) {
+    redirectEl.textContent = yt.redirectUri;
+  }
+
+  setText('yt-allowed', yt.allowedPlatforms?.join(', ') || 'ไม่มี');
+
+  const blockedEl = document.getElementById('yt-blocked-list');
+  if (blockedEl && yt.blockedPlatforms) {
+    blockedEl.innerHTML = yt.blockedPlatforms.map(p =>
+      \`<span style="display:inline-block;margin:3px 5px 3px 0;padding:3px 10px;border-radius:99px;background:var(--red-dim);color:var(--red);border:1px solid #4a0d0d;font-size:.72rem;font-weight:600">🚫 \${esc(p)}</span>\`
+    ).join('');
+  }
+}
+
+function renderHealth(d) {
+  const grid = document.getElementById('health-grid');
+  if (grid) {
+    const up = Math.floor(d.uptime || 0);
+    const upStr = up < 60 ? \`\${up}s\` : up < 3600 ? \`\${Math.floor(up/60)}m \${up%60}s\` : \`\${Math.floor(up/3600)}h \${Math.floor((up%3600)/60)}m\`;
+    const cards = [
+      { icon:'🖥',  lbl:'Node.js Server',   val:'ออนไลน์',                         cls:'h-ok' },
+      { icon:'⏱',  lbl:'Uptime',            val: upStr,                             cls:'h-info' },
+      { icon:'💾',  lbl:'Memory (RSS)',      val: \`\${d.memMB ?? '?'} MB\`,         cls: (d.memMB||0) > 400 ? 'h-warn' : 'h-ok' },
+      { icon:'📦',  lbl:'Node Version',      val: d.node || '?',                    cls:'h-info' },
+      { icon:'🤖',  lbl:'Claude CLI',        val: d.cliStatus?.claude ? '✅ ติดตั้งแล้ว' : '❌ ยังไม่ได้ติดตั้ง',  cls: d.cliStatus?.claude  ? 'h-ok' : 'h-err' },
+      { icon:'🔎',  lbl:'Codex CLI',         val: d.cliStatus?.codex  ? '✅ ติดตั้งแล้ว' : '⚠ ยังไม่ได้ติดตั้ง',  cls: d.cliStatus?.codex   ? 'h-ok' : 'h-warn' },
+      { icon:'🌟',  lbl:'Gemini CLI',        val: d.cliStatus?.gemini ? '✅ ติดตั้งแล้ว' : '⚠ ยังไม่ได้ติดตั้ง',  cls: d.cliStatus?.gemini  ? 'h-ok' : 'h-warn' },
+      { icon:'🎬',  lbl:'โหมด Render',       val: d.renderMode === 'production' ? '✅ ใช้งานจริง' : '⚠ Demo / Mock', cls: d.renderMode === 'production' ? 'h-ok' : 'h-warn' },
+    ];
+    grid.innerHTML = cards.map(c =>
+      \`<div class="h-card"><div class="h-icon">\${c.icon}</div><div class="h-label">\${c.lbl}</div><div class="h-val \${c.cls}">\${esc(String(c.val))}</div></div>\`
+    ).join('');
+  }
+  const apiList = document.getElementById('health-api-list');
+  if (apiList && d.apiStatus) {
+    const entries = Object.entries(d.apiStatus);
+    const ok  = entries.filter(([,v]) => v);
+    const bad = entries.filter(([,v]) => !v);
+    let html = '';
+    if (ok.length) {
+      html += \`<div style="color:var(--green);font-size:.72rem;font-weight:600;margin-bottom:6px">✅ API ที่เชื่อมต่อแล้ว (\${ok.length})</div>\`;
+      html += ok.map(([k]) => \`<div style="padding:4px 0;border-bottom:1px solid #080e1e;display:flex;align-items:center;gap:8px"><span style="color:var(--green);font-size:.7rem">●</span><code style="font-size:.73rem;color:var(--txt)">\${esc(k)}</code></div>\`).join('');
+    }
+    if (bad.length) {
+      html += \`<div style="color:var(--amber);font-size:.72rem;font-weight:600;margin-top:12px;margin-bottom:6px">⚠ API ที่ยังไม่ได้ตั้งค่า (\${bad.length}) — Mock Mode</div>\`;
+      html += bad.map(([k]) => \`<div style="padding:4px 0;border-bottom:1px solid #080e1e;display:flex;align-items:center;gap:8px"><span style="color:var(--amber);font-size:.7rem">○</span><code style="font-size:.73rem;color:var(--muted)">\${esc(k)}</code></div>\`).join('');
+    }
+    apiList.innerHTML = html;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // CLOCK
 // ══════════════════════════════════════════════════════════════════════════════
 function tick() {
@@ -1028,6 +1740,134 @@ function tick() {
   if (el) el.textContent = new Date().toLocaleTimeString('th', { hour12:false });
 }
 setInterval(tick, 1000); tick();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP CHECKLIST
+// ══════════════════════════════════════════════════════════════════════════════
+function renderSetupChecklist(d) {
+  const banner  = document.getElementById('setup-banner');
+  const grid    = document.getElementById('setup-grid');
+  if (!grid) return;
+
+  const isDemoMode = d.demoMode;
+  const api  = d.apiStatus || {};
+  const cli  = d.cliStatus || {};
+  const hints = d.cliInstallHints || {};
+  const pub  = d.publisherReadiness || {};
+
+  // Top-level banner
+  if (banner) {
+    if (isDemoMode) {
+      banner.innerHTML = \`<div class="warn-banner"><strong>⚠️ ยังอยู่ใน Demo Mode</strong>การเผยแพร่และการเรนเดอร์ทั้งหมดเป็นการจำลอง — ไม่ได้โพสต์จริง<br>ตั้งค่า <code style="color:var(--amber)">DEMO_MODE=false</code> ใน .env เพื่อเปิดใช้งาน Production</div>\`;
+    } else {
+      const missingKeys = Object.entries(api).filter(([,v]) => !v).length;
+      const missingClis = Object.entries(cli).filter(([,v]) => !v).length;
+      if (missingKeys === 0 && missingClis === 0) {
+        banner.innerHTML = \`<div class="ok-banner">✅ ระบบพร้อมใช้งาน Production — API Keys และ CLI Tools ครบถ้วน</div>\`;
+      } else {
+        banner.innerHTML = \`<div class="warn-banner"><strong>⚠️ Production Mode เปิดอยู่ แต่ยังมีรายการที่ต้องตั้งค่า</strong>ขาด \${missingKeys} API Key และ \${missingClis} CLI Tool</div>\`;
+      }
+    }
+  }
+
+  function mkItem(icon, label, note, hint) {
+    return \`<div class="chk-item">
+      <div class="chk-icon">\${icon}</div>
+      <div class="chk-body">
+        <div class="chk-label">\${esc(label)}</div>
+        \${note ? \`<div class="chk-note">\${esc(note)}</div>\` : ''}
+        \${hint ? \`<div class="chk-hint">\${esc(hint)}</div>\` : ''}
+      </div>
+    </div>\`;
+  }
+
+  function apiIcon(ok) { return ok ? '✅' : '❌'; }
+  function cliIcon(ok) { return ok ? '✅' : '⚠️'; }
+
+  const sections = [
+    {
+      title: '🖥 CLI Tools',
+      items: [
+        mkItem(cliIcon(cli.claude), 'Claude CLI', cli.claude ? \`ติดตั้งแล้ว — \${esc(d.cliVersions?.claude||'')}\` : 'ยังไม่ได้ติดตั้ง Claude CLI', hints.claude),
+        mkItem(cliIcon(cli.codex),  'Codex CLI',  cli.codex  ? \`ติดตั้งแล้ว — \${esc(d.cliVersions?.codex||'')}\`  : 'ยังไม่ได้ติดตั้ง Codex CLI',  hints.codex),
+        mkItem(cliIcon(cli.gemini), 'Gemini CLI', cli.gemini ? \`ติดตั้งแล้ว — \${esc(d.cliVersions?.gemini||'')}\` : 'ยังไม่ได้ติดตั้ง Gemini CLI', hints.gemini),
+      ],
+    },
+    {
+      title: '🤖 LLM API Keys',
+      items: [
+        mkItem(apiIcon(api.ANTHROPIC_API_KEY), 'ANTHROPIC_API_KEY', api.ANTHROPIC_API_KEY ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Claude Builder จะใช้ mock', null),
+        mkItem(apiIcon(api.OPENAI_API_KEY),    'OPENAI_API_KEY',    api.OPENAI_API_KEY    ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Codex Reviewer จะใช้ mock', null),
+        mkItem(apiIcon(api.GEMINI_API_KEY),    'GEMINI_API_KEY',    api.GEMINI_API_KEY    ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Gemini Research จะใช้ mock', null),
+      ],
+    },
+    {
+      title: '🎬 Content Production APIs',
+      items: [
+        mkItem(apiIcon(api.CREATOMATE_API_KEY),  'CREATOMATE_API_KEY',  api.CREATOMATE_API_KEY  ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Video Renderer จะใช้ mock URL', null),
+        mkItem(apiIcon(api.ELEVENLABS_API_KEY),  'ELEVENLABS_API_KEY',  api.ELEVENLABS_API_KEY  ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Voiceover จะสร้างไฟล์ mock', null),
+        mkItem(apiIcon(api.PEXELS_API_KEY),      'PEXELS_API_KEY',      api.PEXELS_API_KEY      ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้งค่า — Asset Finder จะใช้ mock assets', null),
+      ],
+    },
+    {
+      title: '🚀 Publisher Readiness',
+      items: [
+        mkItem(
+          pub.tiktok?.ready  ? '✅' : isDemoMode ? '⚠️' : '❌',
+          'TikTok',
+          pub.tiktok?.note || '',
+          !pub.tiktok?.ready && !isDemoMode
+            ? 'ต้องการ: TIKTOK_CLIENT_KEY + TIKTOK_CLIENT_SECRET + TIKTOK_USER_ACCESS_TOKEN'
+            : null
+        ),
+        mkItem(
+          pub.youtube?.ready ? '✅' : isDemoMode ? '⚠️' : '❌',
+          'YouTube Shorts',
+          pub.youtube?.note || '',
+          !pub.youtube?.ready && !isDemoMode ? 'ต้องการ: YOUTUBE_OAUTH_TOKEN (API Key อย่างเดียวไม่พอ)' : null
+        ),
+        mkItem(
+          pub.instagram?.ready ? '✅' : isDemoMode ? '⚠️' : '❌',
+          'Instagram Reels',
+          pub.instagram?.note || '',
+          !pub.instagram?.ready && !isDemoMode ? 'ต้องการ: META_API_KEY + INSTAGRAM_ACCOUNT_ID' : null
+        ),
+      ],
+    },
+    {
+      title: '⚙️ โหมดการทำงาน',
+      items: [
+        mkItem(
+          isDemoMode ? '⚠️' : '✅',
+          isDemoMode ? 'Demo Mode (DEMO_MODE=true)' : 'Production Mode (DEMO_MODE=false)',
+          isDemoMode
+            ? 'การเผยแพร่/เรนเดอร์ทั้งหมดเป็นการจำลอง ไม่ได้ทำงานจริง'
+            : 'ระบบทำงานในโหมด Production — API ที่ขาดจะ return error จริง',
+          isDemoMode ? 'แก้ใน .env: DEMO_MODE=false' : null
+        ),
+      ],
+    },
+  ];
+
+  grid.innerHTML = sections.map(s =>
+    \`<div class="card setup-section">
+      <div class="setup-section-title">\${s.title}</div>
+      \${s.items.join('')}
+    </div>\`
+  ).join('');
+}
+
+// ── Polling fallback (2s) — keeps UI fresh when WebSocket is unavailable ─────
+setInterval(async () => {
+  if (socket.connected) return; // WebSocket handles it when connected
+  try {
+    const r = await fetch('/api/agents/status');
+    if (!r.ok) return;
+    const agents = await r.json();
+    agents.forEach(a => { agentStore[a.name] = a; });
+    renderAgGrid(); renderAdGrid(); updateStats(); renderPipeline(); updateBriefing();
+  } catch(e) { /* offline */ }
+}, 2000);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // UTILS

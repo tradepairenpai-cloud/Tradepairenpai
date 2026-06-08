@@ -45,7 +45,12 @@ export async function generateVoiceover(
     logger.info(`[ElevenLabs] Saved voiceover: ${filePath}`);
     return { ok: true, filePath };
   } catch (err: unknown) {
-    const e = err as { message?: string };
+    const e = err as { response?: { status?: number }; message?: string };
+    if (e.response?.status === 402) {
+      logger.warn('[ElevenLabs] Quota exceeded (402) — writing mock voiceover file');
+      fs.writeFileSync(filePath, `MOCK VOICEOVER: ${text}`);
+      return { ok: true, filePath, mock: true };
+    }
     logger.error(`[ElevenLabs] generateVoiceover error: ${e.message}`);
     return { ok: false, error: e.message };
   }

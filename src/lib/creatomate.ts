@@ -5,7 +5,8 @@ import { logger } from './logger';
 const BASE_URL = 'https://api.creatomate.com/v1';
 
 export interface RenderRequest {
-  templateId: string;
+  templateId?: string;
+  source?: Record<string, unknown>;
   modifications?: Record<string, unknown>;
 }
 
@@ -31,10 +32,17 @@ function mockRender(req: RenderRequest): RenderResult {
 
 export async function createRender(req: RenderRequest): Promise<RenderResult> {
   if (!config.creatomateApiKey) return mockRender(req);
+  if (!req.templateId && !req.source) return mockRender(req);
   try {
+    const body: Record<string, unknown> = { modifications: req.modifications ?? {} };
+    if (req.source) {
+      body['source'] = req.source;
+    } else {
+      body['template_id'] = req.templateId;
+    }
     const res = await axios.post(
       `${BASE_URL}/renders`,
-      { template_id: req.templateId, modifications: req.modifications ?? {} },
+      body,
       { headers: { Authorization: `Bearer ${config.creatomateApiKey}` } }
     );
     const data = res.data[0] ?? res.data;

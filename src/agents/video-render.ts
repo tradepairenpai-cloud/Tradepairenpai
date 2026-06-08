@@ -3,7 +3,8 @@ import { AgentResult } from './types';
 import { createRender, getRenderStatus } from '../lib/creatomate';
 
 export interface VideoRenderInput {
-  templateId: string;
+  templateId?: string;
+  source?: Record<string, unknown>;
   modifications?: Record<string, unknown>;
   waitForCompletion?: boolean;
   pollIntervalMs?: number;
@@ -17,16 +18,18 @@ export class VideoRenderAgent extends BaseAgent {
   async run(input: unknown): Promise<AgentResult> {
     const {
       templateId,
+      source,
       modifications = {},
       waitForCompletion = true,
       pollIntervalMs = 5000,
       maxWaitMs = 300000,
     } = input as VideoRenderInput;
 
-    this.setStatus('running', `rendering template: ${templateId}`);
-    this.log('info', `Starting render for template: ${templateId}`);
+    const label = templateId || (source ? 'inline-source' : 'unknown');
+    this.setStatus('running', `rendering: ${label}`);
+    this.log('info', `Starting render: ${label}`);
 
-    const render = await createRender({ templateId, modifications });
+    const render = await createRender({ templateId, source, modifications });
     if (!render.ok) {
       this.setStatus('failed', render.error || 'render failed');
       return { ok: false, output: null, error: render.error };
